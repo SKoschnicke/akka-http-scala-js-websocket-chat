@@ -16,7 +16,7 @@ object ChatBuild extends Build {
 
   lazy val root =
     Project("root", file("."))
-      .aggregate(frontend, backend, cli)
+      .aggregate(frontend, backend, cli, gameMaster)
 
   // Scala-Js frontend
   lazy val frontend =
@@ -53,6 +53,7 @@ object ChatBuild extends Build {
       )
       .dependsOn(sharedJvm)
 
+  // Command line client
   lazy val cli =
     Project("cli", file("cli"))
       .settings(Revolver.settings: _*)
@@ -67,6 +68,22 @@ object ChatBuild extends Build {
         connectInput in run := true
       )
       .dependsOn(sharedJvm)
+
+  // Game master
+  lazy val gameMaster =
+    Project("game_master", file("game_master"))
+      .settings(Revolver.settings: _*)
+      .settings(commonSettings: _*)
+      .settings(
+      libraryDependencies ++= Seq(
+        "com.typesafe.akka" %% "akka-http-core" % akkaHttpV,
+        "org.specs2" %% "specs2" % "2.3.12" % "test",
+        "com.lihaoyi" %% "upickle" % upickleV
+      ),
+      fork in run := true,
+      connectInput in run := true
+    )
+    .dependsOn(sharedJvm)
 
   lazy val shared = (crossProject.crossType(CrossType.Pure) in file ("shared")).
     settings(
