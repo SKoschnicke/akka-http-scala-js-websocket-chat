@@ -17,7 +17,7 @@ import shared.Protocol
 import shared.Protocol._
 
 class Webservice(implicit fm: Materializer, system: ActorSystem) extends Directives {
-  val theChat = Chat.create(system)
+  val theChat = Chat.create(fm, system)
   import system.dispatcher
   system.scheduler.schedule(15.second, 15.second) {
     theChat.injectMessage(ChatMessage(sender = "clock", s"Bling! The time is ${new Date().toString}."))

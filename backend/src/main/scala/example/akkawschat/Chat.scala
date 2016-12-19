@@ -1,6 +1,10 @@
 package example.akkawschat
 
 import akka.actor._
+import akka.NotUsed
+import akka.stream.{ KillSwitches, Materializer, UniqueKillSwitch }
+import akka.stream.scaladsl.{ Keep, MergeHub }
+import scala.concurrent.duration._
 import akka.stream.OverflowStrategy
 import akka.stream.scaladsl._
 import shared.Protocol
@@ -12,56 +16,87 @@ trait Chat {
 }
 
 object Chat {
-  def create(system: ActorSystem): Chat = {
-    // The implementation uses a single actor per chat to collect and distribute
-    // chat messages. It would be nicer if this could be built by stream operations
-    // directly.
+  def create(implicit fm: Materializer, system: ActorSystem): Chat = {
+
+    // from http://doc.akka.io/docs/akka/2.4.14/scala/stream/stream-dynamic.html#Combining_dynamic_stages_to_build_a_simple_Publish-Subscribe_service
+
+    // Obtain a Sink and Source which will publish and receive from the "bus" respectively.
+    val (sink, source) =
+      MergeHub.source[String](perProducerBufferSize = 16)
+        .toMat(BroadcastHub.sink(bufferSize = 256))(Keep.both)
+        .run()
+    // Ensure that the Broadcast output is dropped if there are no listening parties.
+    // If this dropping Sink is not attached, then the broadcast hub will not drop any
+    // elements itself when there are no subscribers, backpressuring the producer instead.
+    source.runWith(Sink.ignore)
+    // We create now a Flow that represents a publish-subscribe channel using the above
+    // started stream as its "topic". We add two more features, external cancellation of
+    // the registration and automatic cleanup for very slow subscribers.
+    val busFlow: Flow[String, String, UniqueKillSwitch] =
+      Flow.fromSinkAndSource(sink, source)
+        .joinMat(KillSwitches.singleBidi[String, String])(Keep.right)
+        .backpressureTimeout(3.seconds)
+
+    // TODO create an actor ref where we can send joined and parted messages to
+    // val broadcaster = source.actorRef[String](1, OverflowStrategy.fail)
+
     val chatActor =
       system.actorOf(Props(new Actor {
-        var subscribers = Set.empty[(String, ActorRef)]
+        var subscribers = Set.empty[String]
 
         def receive: Receive = {
-          case NewParticipant(name, subscriber) ⇒
-            context.watch(subscriber)
-            subscribers += (name -> subscriber)
+          case NewParticipant(name) ⇒
+            subscribers += name
             dispatch(Protocol.Joined(name, members))
-          case msg: ReceivedMessage      ⇒ dispatch(msg.toChatMessage)
+          case msg: ReceivedMessage ⇒
+            println(s"Recieved Message ${msg}")
+            dispatch(msg.toChatMessage)
           case msg: Protocol.ChatMessage ⇒ dispatch(msg)
-          case ParticipantLeft(person) ⇒
+          case ParticipantLeft(person)   ⇒
+          /*
             val entry @ (name, ref) = subscribers.find(_._1 == person).get
             // report downstream of completion, otherwise, there's a risk of leaking the
             // downstream when the TCP connection is only half-closed
             ref ! Status.Success(Unit)
             subscribers -= entry
             dispatch(Protocol.Left(person, members))
-          case Terminated(sub) ⇒
-            // clean up dead subscribers, but should have been removed when `ParticipantLeft`
-            subscribers = subscribers.filterNot(_._2 == sub)
+             */
+          case Terminated(sub)           ⇒
+          // clean up dead subscribers, but should have been removed when `ParticipantLeft`
+          //subscribers = subscribers.filterNot(_._2 == sub)
+          case s                         ⇒ println(s"Received something: ${s}")
         }
         def sendAdminMessage(msg: String): Unit = dispatch(Protocol.ChatMessage("admin", msg))
-        def dispatch(msg: Protocol.Message): Unit = subscribers.foreach(_._2 ! msg)
-        def members = subscribers.map(_._1).toSeq
+        def dispatch(msg: Protocol.Message): Unit = broadcaster ! msg
+        def members = subscribers.toSeq
       }))
 
     // Wraps the chatActor in a sink. When the stream to this sink will be completed
     // it sends the `ParticipantLeft` message to the chatActor.
     // FIXME: here some rate-limiting should be applied to prevent single users flooding the chat
-    def chatInSink(sender: String) = Sink.actorRef[ChatEvent](chatActor, ParticipantLeft(sender))
+    //    def chatInSink(sender: String) = Sink.actorRef[ChatEvent](chatActor, ParticipantLeft(sender))
+    source.runForeach(msg ⇒ chatActor ! msg)
 
     new Chat {
       def chatFlow(sender: String): Flow[String, Protocol.ChatMessage, Any] = {
-        val in =
-          Flow[String]
-            .map(ReceivedMessage(sender, _))
-            .to(chatInSink(sender))
+
+        chatActor ! NewParticipant(sender)
+        val chatMsgParser = """ChatMessage\(([^,]+),([^\)]+)\)""".r
+        val out: Source[Protocol.ChatMessage, NotUsed] =
+          source.map { s ⇒
+            chatMsgParser.findFirstIn(s) match {
+              case Some(chatMsgParser(sender, message)) ⇒ Protocol.ChatMessage(sender, message)
+              case None                                 ⇒ Protocol.ChatMessage("server", s"received unparsable message: ${s}")
+            }
+          }
 
         // The counter-part which is a source that will create a target ActorRef per
         // materialization where the chatActor will send its messages to.
         // This source will only buffer one element and will fail if the client doesn't read
         // messages fast enough.
-        val out =
-          Source.actorRef[Protocol.ChatMessage](1, OverflowStrategy.fail)
-            .mapMaterializedValue(chatActor ! NewParticipant(sender, _))
+        /*
+           */
+        val in: Sink[String, NotUsed] = sink.contramap { s ⇒ Protocol.ChatMessage(sender, s).toString }
 
         Flow.fromSinkAndSource(in, out)
       }
@@ -70,7 +105,7 @@ object Chat {
   }
 
   private sealed trait ChatEvent
-  private case class NewParticipant(name: String, subscriber: ActorRef) extends ChatEvent
+  private case class NewParticipant(name: String) extends ChatEvent
   private case class ParticipantLeft(name: String) extends ChatEvent
   private case class ReceivedMessage(sender: String, message: String) extends ChatEvent {
     def toChatMessage: Protocol.ChatMessage = Protocol.ChatMessage(sender, message)
