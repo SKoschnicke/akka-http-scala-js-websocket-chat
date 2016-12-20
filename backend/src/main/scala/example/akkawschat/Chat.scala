@@ -37,8 +37,8 @@ object Chat {
         .joinMat(KillSwitches.singleBidi[String, String])(Keep.right)
         .backpressureTimeout(3.seconds)
 
-    // TODO create an actor ref where we can send joined and parted messages to
-    // val broadcaster = source.actorRef[String](1, OverflowStrategy.fail)
+    // actor where messages may be sent to which are broadcasted
+    val broadcaster = sink.runWith(Source.actorRef[String](1, OverflowStrategy.fail))
 
     val chatActor =
       system.actorOf(Props(new Actor {
@@ -47,12 +47,13 @@ object Chat {
         def receive: Receive = {
           case NewParticipant(name) ⇒
             subscribers += name
-            dispatch(Protocol.Joined(name, members))
+            broadcast(Protocol.Joined(name, members))
           case msg: ReceivedMessage ⇒
+            println(s"Recieved Message (will not broadcast) ${msg}")
+          case msg: Protocol.ChatMessage ⇒
             println(s"Recieved Message ${msg}")
-            dispatch(msg.toChatMessage)
-          case msg: Protocol.ChatMessage ⇒ dispatch(msg)
-          case ParticipantLeft(person)   ⇒
+            broadcast(msg)
+          case ParticipantLeft(person) ⇒
           /*
             val entry @ (name, ref) = subscribers.find(_._1 == person).get
             // report downstream of completion, otherwise, there's a risk of leaking the
@@ -61,13 +62,13 @@ object Chat {
             subscribers -= entry
             dispatch(Protocol.Left(person, members))
              */
-          case Terminated(sub)           ⇒
+          case Terminated(sub)         ⇒
           // clean up dead subscribers, but should have been removed when `ParticipantLeft`
           //subscribers = subscribers.filterNot(_._2 == sub)
-          case s                         ⇒ println(s"Received something: ${s}")
+          case s                       ⇒ println(s"Received something: ${s}")
         }
-        def sendAdminMessage(msg: String): Unit = dispatch(Protocol.ChatMessage("admin", msg))
-        def dispatch(msg: Protocol.Message): Unit = broadcaster ! msg
+        def sendAdminMessage(msg: String): Unit = broadcast(Protocol.ChatMessage("admin", msg))
+        def broadcast(msg: Protocol.Message): Unit = broadcaster ! msg.toString
         def members = subscribers.toSeq
       }))
 
@@ -83,7 +84,8 @@ object Chat {
         chatActor ! NewParticipant(sender)
         val chatMsgParser = """ChatMessage\(([^,]+),([^\)]+)\)""".r
         val out: Source[Protocol.ChatMessage, NotUsed] =
-          source.map { s ⇒
+          source.map { s: String ⇒
+            // TODO handle Protocol.Joined messages as they are broadcasted when a new client joins
             chatMsgParser.findFirstIn(s) match {
               case Some(chatMsgParser(sender, message)) ⇒ Protocol.ChatMessage(sender, message)
               case None                                 ⇒ Protocol.ChatMessage("server", s"received unparsable message: ${s}")
